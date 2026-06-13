@@ -21,6 +21,18 @@ make clean  # remove build artifacts
 The app runs as a menu bar accessory (`LSUIElement`) — no Dock icon. Quit it
 from its menu (**Quit NavbarMonit**, ⌘Q).
 
+## Usage
+
+- **Left click** — readout menu (live CPU/RAM/disk, Open Activity Monitor, Settings, Quit).
+- **Right click** (or ⌃-click) — open the Settings window.
+- **Hover** — tooltip with exact percentages and free space.
+
+### Settings
+
+- **Start at login** — register the app as a login item (`SMAppService`).
+- **Display mode** — *Packed* (three horizontal bars stacked) or *Flat* (three vertical bars side by side).
+- **Refresh interval** — 1 / 2 / 5 / 10 seconds.
+
 ## How it works
 
 - **CPU** — `host_statistics(HOST_CPU_LOAD_INFO)`, busy/total tick delta between samples.

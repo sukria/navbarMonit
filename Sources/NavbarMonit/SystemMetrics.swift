@@ -11,11 +11,18 @@ final class SystemMetrics {
         var disk: Double  // 0.0 ... 1.0
     }
 
+    /// Human-readable detail for a metric, in gigabytes.
+    struct Detail {
+        var usedGB: Double
+        var totalGB: Double
+        var availGB: Double
+    }
+
     // Previous CPU tick state, used to compute the delta.
     private var previousCPUTicks: (user: UInt32, system: UInt32, idle: UInt32, nice: UInt32)?
 
     func sample() -> Snapshot {
-        Snapshot(cpu: cpuUsage(), ram: ramUsage(), disk: diskUsage())
+        Snapshot(cpu: cpuUsage(), ram: Self.ramUsage(), disk: Self.diskUsage())
     }
 
     // MARK: - CPU
@@ -52,7 +59,8 @@ final class SystemMetrics {
 
     // MARK: - RAM
 
-    private func ramUsage() -> Double {
+    /// Used RAM in bytes: active + wired + compressed pages.
+    private static func ramUsedBytes() -> Double {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
 
@@ -67,32 +75,29 @@ final class SystemMetrics {
         let active = Double(stats.active_count) * pageSize
         let wired = Double(stats.wire_count) * pageSize
         let compressed = Double(stats.compressor_page_count) * pageSize
-        let used = active + wired + compressed
+        return active + wired + compressed
+    }
 
-        let total = Double(ProcessInfo.processInfo.physicalMemory)
+    private static func ramTotalBytes() -> Double {
+        Double(ProcessInfo.processInfo.physicalMemory)
+    }
+
+    static func ramUsage() -> Double {
+        let total = ramTotalBytes()
         guard total > 0 else { return 0 }
-        return max(0, min(1, used / total))
+        return max(0, min(1, ramUsedBytes() / total))
+    }
+
+    static func ramDetail() -> Detail {
+        let gb = 1_073_741_824.0
+        let total = ramTotalBytes()
+        let used = ramUsedBytes()
+        return Detail(usedGB: used / gb, totalGB: total / gb, availGB: max(0, total - used) / gb)
     }
 
     // MARK: - Disk
 
-    private func diskUsage() -> Double {
-        let url = URL(fileURLWithPath: "/")
-        guard let values = try? url.resourceValues(forKeys: [
-            .volumeTotalCapacityKey,
-            .volumeAvailableCapacityForImportantUsageKey
-        ]),
-        let total = values.volumeTotalCapacity,
-        let available = values.volumeAvailableCapacityForImportantUsage,
-        total > 0 else { return 0 }
-
-        let used = Double(total) - Double(available)
-        return max(0, min(1, used / Double(total)))
-    }
-
-    // MARK: - Helpers for the detailed display
-
-    static func diskDetail() -> (usedGB: Double, totalGB: Double) {
+    private static func diskBytes() -> (total: Double, available: Double) {
         let url = URL(fileURLWithPath: "/")
         guard let values = try? url.resourceValues(forKeys: [
             .volumeTotalCapacityKey,
@@ -102,12 +107,18 @@ final class SystemMetrics {
         let available = values.volumeAvailableCapacityForImportantUsage else {
             return (0, 0)
         }
-        let gb = 1_000_000_000.0
-        let used = Double(total - Int(available)) / gb
-        return (used, Double(total) / gb)
+        return (Double(total), Double(available))
     }
 
-    static func ramTotalGB() -> Double {
-        Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+    static func diskUsage() -> Double {
+        let b = diskBytes()
+        guard b.total > 0 else { return 0 }
+        return max(0, min(1, (b.total - b.available) / b.total))
+    }
+
+    static func diskDetail() -> Detail {
+        let gb = 1_000_000_000.0
+        let b = diskBytes()
+        return Detail(usedGB: (b.total - b.available) / gb, totalGB: b.total / gb, availGB: b.available / gb)
     }
 }
