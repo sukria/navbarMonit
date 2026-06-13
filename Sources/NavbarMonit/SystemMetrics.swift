@@ -1,8 +1,10 @@
 import Foundation
 import Darwin
+import IOKit
+import IOKit.ps
 
-/// Collects system metrics: CPU, RAM, disk.
-/// No external dependencies — only Mach/BSD APIs.
+/// Collects system metrics: CPU, RAM, disk, network, disk I/O, battery, top processes.
+/// No third-party dependencies — only Mach/BSD/IOKit APIs (plus `/bin/ps` for processes).
 final class SystemMetrics {
 
     struct Snapshot {
@@ -18,8 +20,20 @@ final class SystemMetrics {
         var availGB: Double
     }
 
-    // Previous CPU tick state, used to compute the delta.
+    struct Rate {
+        var inBytes: Double   // bytes / second
+        var outBytes: Double  // bytes / second
+    }
+
+    struct Battery {
+        var level: Double     // 0.0 ... 1.0
+        var charging: Bool
+    }
+
+    // Per-instance state for delta-based metrics.
     private var previousCPUTicks: (user: UInt32, system: UInt32, idle: UInt32, nice: UInt32)?
+    private var previousNet: (rx: UInt64, tx: UInt64, time: Double)?
+    private var previousIO: (read: UInt64, write: UInt64, time: Double)?
 
     func sample() -> Snapshot {
         Snapshot(cpu: cpuUsage(), ram: Self.ramUsage(), disk: Self.diskUsage())
@@ -46,13 +60,8 @@ final class SystemMetrics {
         defer { previousCPUTicks = (user, system, idle, nice) }
         guard let prev = previousCPUTicks else { return 0 }
 
-        let userDiff = Double(user &- prev.user)
-        let systemDiff = Double(system &- prev.system)
-        let idleDiff = Double(idle &- prev.idle)
-        let niceDiff = Double(nice &- prev.nice)
-
-        let busy = userDiff + systemDiff + niceDiff
-        let total = busy + idleDiff
+        let busy = Double(user &- prev.user) + Double(system &- prev.system) + Double(nice &- prev.nice)
+        let total = busy + Double(idle &- prev.idle)
         guard total > 0 else { return 0 }
         return max(0, min(1, busy / total))
     }
@@ -95,7 +104,7 @@ final class SystemMetrics {
         return Detail(usedGB: used / gb, totalGB: total / gb, availGB: max(0, total - used) / gb)
     }
 
-    // MARK: - Disk
+    // MARK: - Disk capacity
 
     private static func diskBytes() -> (total: Double, available: Double) {
         let url = URL(fileURLWithPath: "/")
@@ -120,5 +129,135 @@ final class SystemMetrics {
         let gb = 1_000_000_000.0
         let b = diskBytes()
         return Detail(usedGB: (b.total - b.available) / gb, totalGB: b.total / gb, availGB: b.available / gb)
+    }
+
+    // MARK: - Network throughput
+
+    private static func networkTotals() -> (rx: UInt64, tx: UInt64) {
+        var rx: UInt64 = 0
+        var tx: UInt64 = 0
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return (0, 0) }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = ptr {
+            let flags = Int32(cur.pointee.ifa_flags)
+            if let addr = cur.pointee.ifa_addr,
+               addr.pointee.sa_family == UInt8(AF_LINK),
+               (flags & IFF_LOOPBACK) == 0,
+               let data = cur.pointee.ifa_data {
+                let d = data.assumingMemoryBound(to: if_data.self)
+                rx += UInt64(d.pointee.ifi_ibytes)
+                tx += UInt64(d.pointee.ifi_obytes)
+            }
+            ptr = cur.pointee.ifa_next
+        }
+        return (rx, tx)
+    }
+
+    func networkRate() -> Rate {
+        let now = ProcessInfo.processInfo.systemUptime
+        let cur = Self.networkTotals()
+        defer { previousNet = (cur.rx, cur.tx, now) }
+        guard let prev = previousNet, now > prev.time else { return Rate(inBytes: 0, outBytes: 0) }
+        let dt = now - prev.time
+        return Rate(inBytes: max(0, Double(cur.rx &- prev.rx) / dt),
+                    outBytes: max(0, Double(cur.tx &- prev.tx) / dt))
+    }
+
+    // MARK: - Disk I/O throughput (IOKit)
+
+    private static func diskIOTotals() -> (read: UInt64, write: UInt64) {
+        var read: UInt64 = 0
+        var write: UInt64 = 0
+        var iterator: io_iterator_t = 0
+        let match = IOServiceMatching("IOBlockStorageDriver")
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator) == KERN_SUCCESS else {
+            return (0, 0)
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            var props: Unmanaged<CFMutableDictionary>?
+            if IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+               let dict = props?.takeRetainedValue() as? [String: Any],
+               let stats = dict["Statistics"] as? [String: Any] {
+                read += (stats["Bytes (Read)"] as? NSNumber)?.uint64Value ?? 0
+                write += (stats["Bytes (Write)"] as? NSNumber)?.uint64Value ?? 0
+            }
+            IOObjectRelease(service)
+            service = IOIteratorNext(iterator)
+        }
+        return (read, write)
+    }
+
+    func diskIORate() -> Rate {
+        let now = ProcessInfo.processInfo.systemUptime
+        let cur = Self.diskIOTotals()
+        defer { previousIO = (cur.read, cur.write, now) }
+        guard let prev = previousIO, now > prev.time else { return Rate(inBytes: 0, outBytes: 0) }
+        let dt = now - prev.time
+        return Rate(inBytes: max(0, Double(cur.read &- prev.read) / dt),
+                    outBytes: max(0, Double(cur.write &- prev.write) / dt))
+    }
+
+    // MARK: - Battery (IOKit.ps)
+
+    static func batteryInfo() -> Battery? {
+        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else {
+            return nil
+        }
+        for source in sources {
+            guard let desc = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any],
+                  let current = desc[kIOPSCurrentCapacityKey as String] as? Int,
+                  let max = desc[kIOPSMaxCapacityKey as String] as? Int, max > 0 else { continue }
+            let charging = (desc[kIOPSIsChargingKey as String] as? Bool) ?? false
+            return Battery(level: Double(current) / Double(max), charging: charging)
+        }
+        return nil
+    }
+
+    // MARK: - Top process (via /bin/ps)
+
+    /// The single heaviest process by CPU or memory. Returns nil if `ps` is unavailable.
+    static func topProcess(byCPU: Bool) -> (name: String, percent: Double)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        // -r sorts by CPU, -m by memory; -c gives the executable name only.
+        process.arguments = byCPU ? ["-Aceo", "pcpu=,comm=", "-r"]
+                                  : ["-Aceo", "pmem=,comm=", "-m"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard let output = String(data: data, encoding: .utf8) else { return nil }
+
+        for line in output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let space = trimmed.firstIndex(of: " ") else { continue }
+            // `ps` formats numbers with the locale's decimal separator (e.g. "39,8").
+            let valueText = trimmed[..<space].replacingOccurrences(of: ",", with: ".")
+            guard let value = Double(valueText) else { continue }
+            let name = trimmed[trimmed.index(after: space)...].trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty { return (name, value) }
+        }
+        return nil
+    }
+
+    // MARK: - Formatting helpers
+
+    /// Formats a byte-rate as "12 KB/s", "1.4 MB/s", etc.
+    static func formatRate(_ bytesPerSecond: Double) -> String {
+        let units = ["B/s", "KB/s", "MB/s", "GB/s"]
+        var value = bytesPerSecond
+        var i = 0
+        while value >= 1024, i < units.count - 1 { value /= 1024; i += 1 }
+        return String(format: i == 0 ? "%.0f %@" : "%.1f %@", value, units[i])
     }
 }

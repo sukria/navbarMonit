@@ -29,9 +29,23 @@ from its menu (**Quit NavbarMonit**, ⌘Q).
 
 ### Settings
 
-- **Start at login** — register the app as a login item (`SMAppService`).
-- **Display mode** — *Packed* (three horizontal bars stacked) or *Flat* (three vertical bars side by side).
+Everything below is toggleable from the Settings window:
+
+**Menu-bar bars** (ratio metrics, fade green → red):
+- **CPU**, **RAM**, **Disk** — show/hide each bar independently.
+- **Show percentage as text** next to the bars.
+- **Layout** — *Packed* (horizontal bars stacked) or *Flat* (vertical bars side by side).
+- **Turn red at** — usage threshold for full red (100% / 90% / 80%).
 - **Refresh interval** — 1 / 2 / 5 / 10 seconds.
+
+**Menu details** (textual rows in the dropdown + tooltip):
+- **Network throughput** (↓/↑), **Disk I/O** (read/write), **Battery** (level + charging).
+- **Top CPU process** and **Top memory process**.
+
+**Start at login** — registers the app as a login item (`SMAppService`).
+
+> Note: CPU temperature is intentionally omitted — there is no public API to read it
+> reliably on Apple Silicon (it requires private SMC access).
 
 ## How it works
 
